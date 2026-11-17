@@ -1,4 +1,4 @@
-# Target Speed (Android, C + SDL2)
+# Acerta o 6 7 (Android, C + SDL2)
 
 Tap the targets before the orange ring runs out. 3 lives, and targets get faster as your score climbs.
 

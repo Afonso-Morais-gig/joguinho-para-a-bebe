@@ -82,6 +82,120 @@ static float g_bg[2][3] = {{95, 18, 75}, {28, 6, 32}};
 static float frand(void) { return (float)rand() / (float)RAND_MAX; }
 static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
+/* ---------- sound: everything is synthesized in code (no audio files) ---------- */
+#define AUDIO_RATE 44100
+#define MAX_VOICES 8
+#define MUSIC_BPM 140
+#define STEP_SAMPLES ((AUDIO_RATE * 60) / (MUSIC_BPM * 4))   /* one 16th note */
+
+typedef struct { bool active; int wave; float phase, f0, f1, t, dur, vol; } Voice;
+static Voice g_voices[MAX_VOICES];
+static SDL_AudioDeviceID g_audio = 0;
+static bool g_musicOn = true;
+static unsigned int g_sample = 0;
+
+/* Original cheerful 2-bar loop (C major, bouncy). Lead notes in Hz, 0 = rest. */
+static const float LEAD[32] = {
+    659,659,0,659, 0,523,659,0,  784,0,0,0, 392,0,0,0,
+    523,0,392,0,   330,0,440,494, 466,440,392,0, 330,0,294,0
+};
+static const float BASS[4] = { 131.0f, 98.0f, 110.0f, 87.0f };  /* one chord per 8 steps */
+
+static float MusicSample(void) {
+    static float leadPhase = 0.0f, bassPhase = 0.0f;
+    const unsigned int step = (g_sample / STEP_SAMPLES) % 32u;
+    const float posStep = (float)(g_sample % STEP_SAMPLES) / (float)STEP_SAMPLES;
+    const unsigned int beatLen = STEP_SAMPLES * 4u;
+    const float posBeat = (float)(g_sample % beatLen) / (float)beatLen;
+    const float bassF = BASS[(g_sample / (STEP_SAMPLES * 8u)) % 4u];
+    float out = 0.0f;
+
+    float lf = LEAD[step];
+    if (lf > 0.0f) {
+        leadPhase += lf / AUDIO_RATE;
+        if (leadPhase >= 1.0f) leadPhase -= 1.0f;
+        float sq = (leadPhase < 0.5f) ? 1.0f : -1.0f;          /* square lead */
+        float env = fmaxf(0.0f, 1.0f - posStep * 2.2f);        /* bouncy staccato */
+        out += sq * env * 0.10f;
+    }
+
+    bassPhase += bassF / AUDIO_RATE;
+    if (bassPhase >= 1.0f) bassPhase -= 1.0f;
+    float tri = 4.0f * fabsf(bassPhase - 0.5f) - 1.0f;         /* triangle bass */
+    float benv = fmaxf(0.0f, 1.0f - posBeat * 1.5f);
+    out += tri * benv * 0.14f;
+
+    g_sample++;
+    return out;
+}
+
+static float VoiceSample(Voice* v) {
+    float p = v->t / v->dur;
+    if (p >= 1.0f) { v->active = false; return 0.0f; }
+    float f = v->f0 * powf(v->f1 / v->f0, p);                  /* exponential pitch sweep */
+    v->phase += f / AUDIO_RATE;
+    if (v->phase >= 1.0f) v->phase -= 1.0f;
+    float osc = (v->wave == 0) ? sinf(v->phase * TAU) : ((v->phase < 0.5f) ? 1.0f : -1.0f);
+    float env = (1.0f - p) * (1.0f - p);
+    v->t += 1.0f / AUDIO_RATE;
+    return osc * env * v->vol;
+}
+
+static void AudioCallback(void* userdata, Uint8* stream, int len) {
+    (void)userdata;
+    float* out = (float*)stream;
+    int n = len / (int)sizeof(float);
+    for (int i = 0; i < n; i++) {
+        float s = MusicSample();
+        if (!g_musicOn) s = 0.0f;
+        for (int v = 0; v < MAX_VOICES; v++)
+            if (g_voices[v].active) s += VoiceSample(&g_voices[v]);
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        out[i] = s;
+    }
+}
+
+static void OpenAudio(void) {
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+        SDL_Log("Audio init failed: %s", SDL_GetError());
+        return;
+    }
+    SDL_AudioSpec want;
+    SDL_zero(want);
+    want.freq = AUDIO_RATE;
+    want.format = AUDIO_F32SYS;
+    want.channels = 1;
+    want.samples = 512;
+    want.callback = AudioCallback;
+    g_audio = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+    if (g_audio) SDL_PauseAudioDevice(g_audio, 0);
+    else SDL_Log("Audio unavailable: %s", SDL_GetError());
+}
+
+static void PlaySfx(int wave, float f0, float f1, float dur, float vol) {
+    if (!g_audio) return;
+    SDL_LockAudioDevice(g_audio);
+    int slot = 0;
+    for (int i = 0; i < MAX_VOICES; i++)
+        if (!g_voices[i].active) { slot = i; break; }
+    Voice* v = &g_voices[slot];
+    v->active = true; v->wave = wave; v->phase = 0.0f;
+    v->f0 = f0; v->f1 = f1; v->t = 0.0f; v->dur = dur; v->vol = vol;
+    SDL_UnlockAudioDevice(g_audio);
+}
+
+/* Bubbly "pop" for a hit: quick falling sine with a little random pitch. */
+static void PlayPop(void) {
+    float f = 900.0f + frand() * 500.0f;
+    PlaySfx(0, f, f * 0.25f, 0.11f, 0.45f);
+}
+
+/* Low square "bwomp" for a missed target. */
+static void PlayMiss(void) {
+    PlaySfx(1, 220.0f, 110.0f, 0.25f, 0.14f);
+}
+
 /* Random hue strictly in the pink / magenta / rose / coral spectrum (300..355 deg) */
 static float randomPinkHue(void) {
     return 305.0f + frand() * 50.0f;
@@ -558,6 +672,7 @@ static void ResetGame(Game* game) {
 static void LoseLifeAt(Game* game, int idx) {
     Target* t = &game->targets[idx];
     SpawnBurst(t->x, t->y, 350.0f, 24, true);
+    PlayMiss();
     g_missFlash = 0.35f;
     game->lives--;
     if (game->lives <= 0) {
@@ -575,6 +690,7 @@ static void LoseLifeAt(Game* game, int idx) {
 static void HitTargetAt(Game* game, int idx) {
     Target* t = &game->targets[idx];
     SpawnBurst(t->x, t->y, t->hue, 22, false);
+    PlayPop();
     SpawnRipple(t->x, t->y, t->hue);
     g_scorePop = 1.0f;
     game->score++;
@@ -584,6 +700,27 @@ static void HitTargetAt(Game* game, int idx) {
 
 /* ---------- UI screens ---------- */
 
+/* Little bouncy bear mascot, drawn with shapes (original art). */
+static void DrawBear(SDL_Renderer* r, float cx, float cy, float s) {
+    cy += sinf(g_time * 3.0f) * 4.0f * s;
+    SDL_Color fur = Rgba(214, 160, 116, 255), inner = Rgba(255, 170, 200, 255);
+    SDL_Color muz = Rgba(246, 220, 190, 255), ink = Rgba(40, 10, 30, 255);
+    FillCircle(r, cx - 62.0f * s, cy - 58.0f * s, 26.0f * s, fur);
+    FillCircle(r, cx + 62.0f * s, cy - 58.0f * s, 26.0f * s, fur);
+    FillCircle(r, cx - 62.0f * s, cy - 58.0f * s, 13.0f * s, inner);
+    FillCircle(r, cx + 62.0f * s, cy - 58.0f * s, 13.0f * s, inner);
+    FillCircle(r, cx, cy, 78.0f * s, fur);
+    FillCircle(r, cx, cy + 22.0f * s, 36.0f * s, muz);
+    FillCircle(r, cx - 30.0f * s, cy - 6.0f * s, 9.0f * s, ink);
+    FillCircle(r, cx + 30.0f * s, cy - 6.0f * s, 9.0f * s, ink);
+    FillCircle(r, cx - 27.0f * s, cy - 9.0f * s, 3.0f * s, Rgba(255, 255, 255, 255));
+    FillCircle(r, cx + 33.0f * s, cy - 9.0f * s, 3.0f * s, Rgba(255, 255, 255, 255));
+    FillCircle(r, cx, cy + 14.0f * s, 9.0f * s, ink);                     /* nose */
+    FillArc(r, cx, cy + 6.0f * s, 20.0f * s, 24.0f * s, 0.4f, 2.7f, ink); /* smile */
+    FillCircle(r, cx - 48.0f * s, cy + 16.0f * s, 11.0f * s, Rgba(255, 120, 170, 150));
+    FillCircle(r, cx + 48.0f * s, cy + 16.0f * s, 11.0f * s, Rgba(255, 120, 170, 150));
+}
+
 static void DrawMenu(SDL_Renderer* r, const Game* game) {
     float cx = SCREEN_WIDTH / 2.0f;
     float cy = (float)g_H * 0.54f;
@@ -592,9 +729,12 @@ static void DrawMenu(SDL_Renderer* r, const Game* game) {
     FillRoundRect(r, 44.0f, (float)g_H * 0.08f - 16.0f, SCREEN_WIDTH - 88.0f, 215.0f, 32.0f, Rgba(255, 105, 180, 28));
     FillRoundRect(r, 48.0f, (float)g_H * 0.08f - 12.0f, SCREEN_WIDTH - 96.0f, 207.0f, 28.0f, Rgba(40, 8, 36, 150));
 
-    /* Game Title: "6 7" on top, "TARGET" below */
-    DrawTextPinkWave(r, cx, (float)g_H * 0.09f, 13.0f, "6 7", 7.0f);
-    DrawTextPinkWave(r, cx, (float)g_H * 0.09f + 105.0f, 10.5f, "TARGET", 6.0f);
+    /* Game Title: "ACERTA" on top, "O 6 7" below */
+    DrawTextPinkWave(r, cx, (float)g_H * 0.09f, 10.0f, "ACERTA", 6.0f);
+    DrawTextPinkWave(r, cx, (float)g_H * 0.09f + 95.0f, 12.0f, "O 6 7", 7.0f);
+
+    /* Mascot in the bottom-right corner, out of the way of the Play button */
+    DrawBear(r, SCREEN_WIDTH - 52.0f, (float)g_H - 150.0f, 0.55f);
 
     /* Expanding pink rings from the play button */
     for (int k = 0; k < 3; k++) {
@@ -734,7 +874,7 @@ int main(int argc, char* argv[]) {
     Uint32 winFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
     SDL_Window* window = SDL_CreateWindow(
-        "6 7 Target",
+        "Acerta o 6 7",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         SCREEN_WIDTH, DEFAULT_HEIGHT, winFlags
     );
@@ -752,6 +892,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    OpenAudio();
 
     /* Match the logical height to the screen shape so there are no bars. */
     int ow = 0, oh = 0;
@@ -903,6 +1044,7 @@ int main(int argc, char* argv[]) {
         SDL_RenderPresent(renderer);
     }
 
+    if (g_audio) SDL_CloseAudioDevice(g_audio);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
